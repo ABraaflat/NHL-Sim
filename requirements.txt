@@ -1,0 +1,6 @@
+   streamlit
+   nflreadpy
+   pandas
+   numpy
+   scikit-learn
+   pyarrow
