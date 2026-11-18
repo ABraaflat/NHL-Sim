@@ -26,6 +26,7 @@ import datetime as dt
 import io
 import json
 import math
+import os
 import re
 import unicodedata
 from collections import Counter
@@ -194,6 +195,34 @@ def slim_pbp(js):
             d.get("goalieInNetId"),
         ))
     plays.sort(key=lambda r: r[0])
+    # per-player shots / goals / assists / power-play points (the backtest rebuilds player stats from these)
+    pstats = {}
+    for p in js.get("plays", []):
+        if (p.get("periodDescriptor") or {}).get("periodType") == "SO":
+            continue
+        typ, d = p.get("typeDescKey", ""), p.get("details") or {}
+        if typ not in ("shot-on-goal", "goal"):
+            continue
+        sh = d.get("shootingPlayerId") or d.get("scoringPlayerId")
+        if sh:
+            ps = pstats.setdefault(sh, [0, 0, 0, 0])
+            ps[0] += 1
+            if typ == "goal":
+                ps[1] += 1
+        if typ == "goal":
+            sit = str(p.get("situationCode") or "1551").zfill(4)
+            own_home = d.get("eventOwnerTeamId") == (js.get("homeTeam") or {}).get("id")
+            try:
+                ag, a_sk, h_sk, hg = (int(c) for c in sit[:4])
+                on_pp = (h_sk > a_sk) if own_home else (a_sk > h_sk)
+            except ValueError:
+                on_pp = False
+            for who in (sh, d.get("assist1PlayerId"), d.get("assist2PlayerId")):
+                if who:
+                    ps = pstats.setdefault(who, [0, 0, 0, 0])
+                    if who != sh:
+                        ps[2] += 1
+                    ps[3] += int(on_pp)
     home, away = js.get("homeTeam") or {}, js.get("awayTeam") or {}
     return dict(
         id=js.get("id"), date=js.get("gameDate", ""),
@@ -202,6 +231,10 @@ def slim_pbp(js):
         home_score=home.get("score"), away_score=away.get("score"),
         plays=plays,
         roster=[(r.get("playerId"), r.get("teamId")) for r in js.get("rosterSpots", [])],
+        rinfo={r.get("playerId"): (r.get("positionCode", "F"),
+                                   f'{(r.get("firstName") or {}).get("default", "")} {(r.get("lastName") or {}).get("default", "")}'.strip())
+               for r in js.get("rosterSpots", [])},
+        pstats=pstats,
     )
 
 
@@ -263,7 +296,13 @@ def build_profile(team, n_recent):
     """Everything the simulator knows about one team, from real data."""
     ids = recent_game_ids(team, n_recent)
     games = fetch_pbps(ids)
+    prof = _profile_core(team, games)
+    prof["skaters"], prof["goalies"] = club_players(team)
+    return prof
 
+
+def _profile_core(team, games):
+    """Team style from a list of slimmed games (rates, shot locations, special teams, lineups)."""
     toi = dict.fromkeys(STATES, 0.0)
     sf, sa = dict.fromkeys(STATES, 0.0), dict.fromkeys(STATES, 0.0)
     shots_for, shots_ag = [], []
@@ -338,8 +377,26 @@ def build_profile(team, n_recent):
         r_ag[s] = 60 * (sa[s] + LG_RATE[MIRROR[s]] / 60 * k) / (mins + k)
     reg_min = sum(toi.values()) / 60 + 1e-9
     pen60 = 60 * (pens + LG_PEN60 / 60 * 300) / (reg_min + 300)
+    n = max(len(games), 1)
+    return dict(
+        team=team, team_id=team_id, n_games=len(games), recent_games=recent_games,
+        toi=toi, sf=sf, sa=sa, r_for=r_for, r_ag=r_ag, pen60=pen60,
+        shots_for=shots_for, shots_ag=shots_ag,
+        gf_per=(gf_per / n).tolist(), ga_per=(ga_per / n).tolist(),
+        sf_per=(sf_per / n).tolist(), sa_per=(sa_per / n).tolist(),
+        pp_pct=ppg / drawn if drawn else None, pk_pct=1 - ppga / pens if pens else None,
+        pens_pg=pens / n, fo_pct=fow / fo if fo else None, hits_pg=hits / n,
+        sog_pg=sum(sf_per) / n, soga_pg=sum(sa_per) / n,
+        gf_pg=sum(gf_per) / n, ga_pg=sum(ga_per) / n,
+        skaters=[], goalies=[], starters=starters,
+        recent_lineup=set().union(*lineups[-2:]) if lineups else set(),
+        last_date=max((g["date"] for g in games if g.get("date")), default=""),
+    )
 
-    # Season player stats for this club
+
+@st.cache_data(ttl=3 * 3600, show_spinner=False)
+def club_players(team):
+    """Season stats for this club's skaters and goalies."""
     try:
         cs = fetch(f"club-stats/{team}/now")
     except Exception:
@@ -371,26 +428,12 @@ def build_profile(team, n_recent):
             svp=svp, gaa=gk.get("goalsAgainstAverage", 0) or 0,
             headshot=gk.get("headshot", ""), w=gk.get("wins", 0) or 0,
         ))
-
-    n = max(len(games), 1)
-    return dict(
-        team=team, team_id=team_id, n_games=len(games), recent_games=recent_games,
-        toi=toi, sf=sf, sa=sa, r_for=r_for, r_ag=r_ag, pen60=pen60,
-        shots_for=shots_for, shots_ag=shots_ag,
-        gf_per=(gf_per / n).tolist(), ga_per=(ga_per / n).tolist(),
-        sf_per=(sf_per / n).tolist(), sa_per=(sa_per / n).tolist(),
-        pp_pct=ppg / drawn if drawn else None, pk_pct=1 - ppga / pens if pens else None,
-        pens_pg=pens / n, fo_pct=fow / fo if fo else None, hits_pg=hits / n,
-        sog_pg=sum(sf_per) / n, soga_pg=sum(sa_per) / n,
-        gf_pg=sum(gf_per) / n, ga_pg=sum(ga_per) / n,
-        skaters=skaters, goalies=goalies, starters=starters,
-        recent_lineup=set().union(*lineups[-2:]) if lineups else set(),
-        last_date=max((g["date"] for g in games if g.get("date")), default=""),
-    )
+    return skaters, goalies
 
 
-def default_lineup(prof):
-    """Probable starting goalie and players not in the recent lineup."""
+def default_lineup(prof, use_lines=True):
+    """Probable starting goalie and players who sit (from DailyFaceoff lines when available,
+    otherwise players who weren't in the last two lineups)."""
     gids = {g["id"] for g in prof["goalies"]}
     recent = [s for s in prof["starters"][-5:] if s in gids]
     if recent:
@@ -401,6 +444,10 @@ def default_lineup(prof):
         goalie = max(prof["goalies"], key=lambda g: (g["gs"], g["gp"]))["id"]
     else:
         goalie = None
+    tl = team_lines(prof) if use_lines and not prof.get("asof") else None
+    if tl and tl["dressed"]:
+        out = tuple(sorted(s["id"] for s in prof["skaters"] if s["id"] not in tl["dressed"]))
+        return goalie, out
     lineup = prof["recent_lineup"]
     out = tuple(sorted(s["id"] for s in prof["skaters"] if lineup and s["id"] not in lineup))
     return goalie, out
@@ -442,7 +489,12 @@ def _gk_factor(gk):
     return float(np.clip((1 - sv) / (1 - LG_SV), 0.7, 1.4))
 
 
-def build_side(prof, opp, goalie_id, out_ids, model):
+SLOT_TOI = {("F", 1): 1080, ("F", 2): 960, ("F", 3): 840, ("F", 4): 690,
+            ("D", 1): 1380, ("D", 2): 1230, ("D", 3): 1050}      # typical total ice time (s) per line slot
+PP_SHARE = {1: 0.64, 2: 0.33}                                     # share of power-play time by unit
+
+
+def build_side(prof, opp, goalie_id, out_ids, model, lines=None):
     dressed = _dressed(prof, out_ids)
     if not dressed:
         dressed = [dict(id=-1, name=f"{prof['team']} skater", pos="F", gp=1, g=0, a=0, shots=2, ppg=0, toi=900)]
@@ -450,11 +502,29 @@ def build_side(prof, opp, goalie_id, out_ids, model):
     shots = np.array([s["shots"] for s in dressed], float)
     spg = shots / gp + 0.3
     toi = np.array([s["toi"] for s in dressed], float) + 1
-    w_ev = spg / spg.sum()
-    w_pp = spg * (toi / toi.mean()) ** 2
+    # role: where a player sits in tonight's lines vs the ice time he has been getting
+    role = np.ones(len(dressed))
+    unit = np.zeros(len(dressed), int)
+    if lines:
+        for i, s_ in enumerate(dressed):
+            slot = lines["slot"].get(s_["id"])
+            if slot in SLOT_TOI:
+                role[i] = float(np.clip((SLOT_TOI[slot] / max(s_["toi"], 300)) ** 0.8, 0.7, 1.4))
+            unit[i] = lines["pp"].get(s_["id"], 0)
+    w_ev = spg * role / (spg * role).sum()
+    w_ast = (np.array([s["a"] for s in dressed], float) / gp + 0.05) * role
+    if lines and unit.any():      # power play: the listed units get the shots and the points
+        share = np.array([PP_SHARE.get(u, 0.03) for u in unit])
+        w_pp = spg * share
+        w_ast_pp = w_ast * share
+        w_ast_pp /= w_ast_pp.sum()
+    else:
+        w_pp = spg * (toi / toi.mean()) ** 2
+        w_ast_pp = None
     w_pp /= w_pp.sum()
-    w_ast = np.array([s["a"] for s in dressed], float) / gp + 0.05
     w_ast /= w_ast.sum()
+    if w_ast_pp is None:
+        w_ast_pp = w_ast
     w_pen = np.array([s.get("pim", 0) for s in dressed], float) / gp + 0.3
     w_pen /= w_pen.sum()
     goals = np.array([s["g"] for s in dressed], float)
@@ -483,7 +553,7 @@ def build_side(prof, opp, goalie_id, out_ids, model):
     return dict(
         team=prof["team"], names=[s["name"] for s in dressed], pos=[s["pos"] for s in dressed],
         ids=[s["id"] for s in dressed],
-        w_ev=w_ev, w_pen=w_pen, w_pp=w_pp, w_ast=w_ast, fin=fin,
+        w_ev=w_ev, w_pen=w_pen, w_pp=w_pp, w_ast=w_ast, w_ast_pp=w_ast_pp, fin=fin, pp_unit=unit.tolist(),
         r_ev=r_ev * off / 3600, r_pp=r_pp * off / 3600, r_sh=r_sh * off / 3600,
         pen_rate=prof["pen60"] / 3600, gk_factor=gk_factor, gk_name=gk_name, off=off,
         loc_for=(fx, fy, fp), loc_ag=(ax, ay, ap),
@@ -512,25 +582,35 @@ def simulate(home, away, n, playoff=False, record=400, seed=None):
     sog_by_min = np.zeros((2, 66))
     events = []                                # detailed log for the first `record` games
 
-    def assists(team, scorers):
-        k, pn, w = len(scorers), P[team], T[team]["w_ast"]
+    def draw(team, is_pp):
+        out = np.empty(len(is_pp), int)
+        pn, tm = P[team], T[team]
+        ev_i, pp_i = np.nonzero(~is_pp)[0], np.nonzero(is_pp)[0]
+        if ev_i.size:
+            out[ev_i] = rng.choice(pn, ev_i.size, p=tm["w_ast"])
+        if pp_i.size:
+            out[pp_i] = rng.choice(pn, pp_i.size, p=tm.get("w_ast_pp", tm["w_ast"]))
+        return out
+
+    def assists(team, scorers, is_pp):
+        k, pn = len(scorers), P[team]
         a1 = np.full(k, -1)
         a2 = np.full(k, -1)
         if pn < 2:
             return a1, a2
-        a1 = rng.choice(pn, k, p=w)
+        a1 = draw(team, is_pp)
         for _ in range(8):
             bad = a1 == scorers
             if not bad.any():
                 break
-            a1[bad] = rng.choice(pn, bad.sum(), p=w)
+            a1[bad] = draw(team, is_pp[bad])
         a1[(a1 == scorers) | (rng.random(k) < 0.07)] = -1
-        a2 = rng.choice(pn, k, p=w)
+        a2 = draw(team, is_pp)
         for _ in range(8):
             bad = (a2 == scorers) | (a2 == a1)
             if not bad.any():
                 break
-            a2[bad] = rng.choice(pn, bad.sum(), p=w)
+            a2[bad] = draw(team, is_pp[bad])
         a2[(a2 == scorers) | (a2 == a1) | (a1 < 0) | (rng.random(k) < 0.22)] = -1
         return a1, a2
 
@@ -545,7 +625,7 @@ def simulate(home, away, n, playoff=False, record=400, seed=None):
         opp = 1 - team
         goals[sims, team] += 1
         np.add.at(g_mat[team], (sims, scorers), 1)
-        a1, a2 = assists(team, scorers)
+        a1, a2 = assists(team, scorers, np.asarray(is_pp, bool))
         for a in (a1, a2):
             ok = a >= 0
             np.add.at(a_mat[team], (sims[ok], a[ok]), 1)
@@ -689,9 +769,9 @@ def simulate(home, away, n, playoff=False, record=400, seed=None):
 LG3 = np.array([LG_RATE["lead"], LG_RATE["tied"], LG_RATE["trail"]])
 
 
-def team_vector(prof, model):
+def team_vector(prof, model, goalie_id=None):
     """One team's real-data profile boiled down to the numbers the fast engine needs."""
-    _, out = default_lineup(prof)
+    _, out = default_lineup(prof, use_lines=False)
     dressed = _dressed(prof, out)
     if dressed:
         gp = np.array([max(s["gp"], 1) for s in dressed], float)
@@ -707,7 +787,10 @@ def team_vector(prof, model):
     else:
         fin_ev = fin_pp = 1.0
     gks = prof["goalies"]
-    if gks:   # season-long: goalies split starts the way they have been
+    gsel = next((g for g in gks if g["id"] == goalie_id), None) if goalie_id is not None else None
+    if gsel:
+        gk = _gk_factor(gsel)
+    elif gks:   # season-long: goalies split starts the way they have been
         w = np.array([g["gs"] + 0.5 for g in gks], float)
         gk = float(np.dot(w, [_gk_factor(g) for g in gks]) / w.sum())
     else:
@@ -1088,7 +1171,8 @@ def is_b2b(prof, game_date):
 
 
 @st.cache_data(show_spinner=False, max_entries=60)
-def run_matchup(home, away, h_goalie, a_goalie, h_out, a_out, n, playoff, n_recent, seed=None, game_date=None):
+def run_matchup(home, away, h_goalie, a_goalie, h_out, a_out, n, playoff, n_recent, seed=None, game_date=None,
+                use_lines=True):
     hp, ap = build_profile(home, n_recent), build_profile(away, n_recent)
     shots = hp["shots_for"] + hp["shots_ag"] + ap["shots_for"] + ap["shots_ag"]
     if shots:
@@ -1096,8 +1180,10 @@ def run_matchup(home, away, h_goalie, a_goalie, h_out, a_out, n, playoff, n_rece
         model = dist_model(arr[:, 2], arr[:, 3])
     else:
         model = DIST_PRIOR.copy()
-    H = build_side(hp, ap, h_goalie, h_out, model)
-    A = build_side(ap, hp, a_goalie, a_out, model)
+    hl = team_lines(hp) if use_lines else None
+    al = team_lines(ap) if use_lines else None
+    H = build_side(hp, ap, h_goalie, h_out, model, hl)
+    A = build_side(ap, hp, a_goalie, a_out, model, al)
     for side, mult in ((H, 1 + HOME_EDGE), (A, 1 - HOME_EDGE)):
         for key in ("r_ev", "r_pp", "r_sh"):
             side[key] = side[key] * mult
@@ -1114,6 +1200,7 @@ def run_matchup(home, away, h_goalie, a_goalie, h_out, a_out, n, playoff, n_rece
     res["playoff"] = playoff
     res["b2b"] = b2b
     res["game_date"] = game_date
+    res["lines"] = dict(home=(hl or {}).get("updated"), away=(al or {}).get("updated"))
     res["props"][0]["goalie_id"], res["props"][1]["goalie_id"] = h_goalie, a_goalie
     return res
 
@@ -1230,7 +1317,7 @@ def rink_shapes():
 
 def rink_layout(height=520):
     return dict(
-        shapes=rink_shapes(), height=height, plot_bgcolor="white", paper_bgcolor="white",
+        shapes=rink_shapes(), height=height, plot_bgcolor="white", paper_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(range=[-102, 102], visible=False, fixedrange=True),
         yaxis=dict(range=[-45, 45], visible=False, scaleanchor="x", fixedrange=True),
         margin=dict(l=10, r=10, t=60, b=10), legend=dict(orientation="h", y=-0.02),
@@ -2066,13 +2153,24 @@ def same_team(feed_name, abbrev):
     return fn == full or fn.split()[-1] == full.split()[-1] or fn == abbrev.lower()
 
 
-def odds_api_key():
-    if st.session_state.get("odds_key"):
-        return st.session_state["odds_key"]
+def secret(name, default=None):
+    """A setting from Streamlit secrets, or from an environment variable (used by the daily GitHub robot)."""
     try:
-        return st.secrets.get("ODDS_API_KEY", "")
+        v = st.secrets.get(name)
+        if v:
+            return v
     except Exception:
-        return ""
+        pass
+    return os.environ.get(name) or default
+
+
+def odds_api_key():
+    try:
+        if st.session_state.get("odds_key"):
+            return st.session_state["odds_key"]
+    except Exception:
+        pass
+    return secret("ODDS_API_KEY", "")
 
 
 def best_lines(evt, res):
@@ -2215,6 +2313,154 @@ def dfo_goalies(date_str):
     return found
 
 
+DFO_SLUG = {"ANA": "anaheim-ducks", "BOS": "boston-bruins", "BUF": "buffalo-sabres", "CGY": "calgary-flames",
+            "CAR": "carolina-hurricanes", "CHI": "chicago-blackhawks", "COL": "colorado-avalanche",
+            "CBJ": "columbus-blue-jackets", "DAL": "dallas-stars", "DET": "detroit-red-wings", "EDM": "edmonton-oilers",
+            "FLA": "florida-panthers", "LAK": "los-angeles-kings", "MIN": "minnesota-wild", "MTL": "montreal-canadiens",
+            "NSH": "nashville-predators", "NJD": "new-jersey-devils", "NYI": "new-york-islanders",
+            "NYR": "new-york-rangers", "OTT": "ottawa-senators", "PHI": "philadelphia-flyers",
+            "PIT": "pittsburgh-penguins", "SJS": "san-jose-sharks", "SEA": "seattle-kraken", "STL": "st-louis-blues",
+            "TBL": "tampa-bay-lightning", "TOR": "toronto-maple-leafs", "UTA": "utah-mammoth",
+            "VAN": "vancouver-canucks", "VGK": "vegas-golden-knights", "WSH": "washington-capitals",
+            "WPG": "winnipeg-jets"}
+DFO_SECTIONS = {"forwards": "F", "defensive pairings": "D", "1st powerplay unit": "PP1", "2nd powerplay unit": "PP2",
+                "1st penalty kill unit": "PK1", "2nd penalty kill unit": "PK2", "goalies": "G", "injuries": "IR"}
+
+
+def _parse_dfo_lines(html):
+    """Sections of a DailyFaceoff line-combinations page: {'F': [names...], 'D': [...], 'PP1': [...], ...}."""
+    marks = []
+    for m in re.finditer(r">\s*(" + "|".join(re.escape(k) for k in DFO_SECTIONS) + r")\s*<", html, re.I):
+        marks.append((m.start(), DFO_SECTIONS[m.group(1).lower()]))
+    if not marks:
+        return {}
+    stop = re.search(r">\s*Badges:\s*<", html)
+    ends = [p for p, _ in marks[1:]] + [stop.start() if stop and stop.start() > marks[-1][0] else len(html)]
+    link = re.compile(r'<a[^>]+href="(?:https?://(?:www\.)?dailyfaceoff\.com)?/players/news/[^"/]+/(\d+)"[^>]*>(.*?)</a>', re.S)
+    out = {}
+    for (pos, key), end in zip(marks, ends):
+        if key in out:          # keep the first copy of each section
+            continue
+        names, seen_last = [], None
+        for m in link.finditer(html, pos, end):
+            pid, inner = m.group(1), m.group(2)
+            alt = re.search(r'alt="([^"]+)"', inner)
+            text = re.sub(r"<[^>]+>", " ", inner)
+            name = html_lib.unescape((alt.group(1) if alt else text).strip())
+            name = re.sub(r"\s+", " ", name)
+            if not name or pid == seen_last:
+                continue
+            seen_last = pid
+            names.append(name)
+        if names:
+            out[key] = names
+    return out
+
+
+def _dfo_from_next(html):
+    """Same structure from the page's embedded data (used if the page layout changes)."""
+    m = re.search(r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return {}
+    try:
+        data = json.loads(m.group(1))
+    except Exception:
+        return {}
+    rows = []
+
+    def walk(o):
+        if isinstance(o, dict):
+            nm = o.get("name") or o.get("playerName")
+            grp = next((str(v) for k, v in o.items() if "group" in k.lower() and isinstance(v, str)), None)
+            if isinstance(nm, str) and grp:
+                rows.append((grp.lower(), nm))
+            for v in o.values():
+                walk(v)
+        elif isinstance(o, list):
+            for v in o:
+                walk(v)
+
+    walk(data)
+    out = {}
+    for grp, nm in rows:
+        key = ("PP1" if re.search(r"pp\s*1|powerplay\s*1|1st power", grp) else
+               "PP2" if re.search(r"pp\s*2|powerplay\s*2|2nd power", grp) else
+               "PK1" if re.search(r"pk\s*1|penalty\s*kill\s*1|1st penalty", grp) else
+               "PK2" if re.search(r"pk\s*2|penalty\s*kill\s*2|2nd penalty", grp) else
+               "F" if re.search(r"^f|forward", grp) else "D" if re.search(r"^d|defen", grp) else
+               "G" if re.search(r"^g|goal", grp) else "IR" if re.search(r"injur|^ir", grp) else None)
+        if key:
+            out.setdefault(key, []).append(nm)
+    return out
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def dfo_lines(team):
+    """DailyFaceoff's projected lines for a team (None if unavailable)."""
+    slug = DFO_SLUG.get(team)
+    if not slug:
+        return None
+    try:
+        r = _session().get(f"https://www.dailyfaceoff.com/teams/{slug}/line-combinations",
+                           headers={"User-Agent": BROWSER_UA, "Accept": "text/html"}, timeout=20)
+        r.raise_for_status()
+        html = r.text
+    except Exception:
+        return None
+    sec = _parse_dfo_lines(html)
+    if len(sec.get("F", [])) < 9 or len(sec.get("D", [])) < 4:
+        sec = _dfo_from_next(html)
+    if len(sec.get("F", [])) < 9 or len(sec.get("D", [])) < 4:
+        return None
+    upd = re.search(r"Last updated:\s*(?:<[^>]+>\s*)*([A-Z][a-z]{2} \d{1,2}, \d{4})", html)
+    sec["updated"] = upd.group(1) if upd else ""
+    return sec
+
+
+def _match_name(name, players):
+    n = _norm(name)
+    for p in players:
+        if _norm(p["name"]) == n:
+            return p["id"]
+    parts = n.split()
+    if not parts:
+        return None
+    c = [p for p in players if _norm(p["name"]).split()[-1:] == parts[-1:]]
+    if len(c) > 1:
+        c = [p for p in c if _norm(p["name"])[:1] == n[:1]]
+    return c[0]["id"] if len(c) == 1 else None
+
+
+def team_lines(prof):
+    """Tonight's projected lines matched to this team's players:
+    slot {player id: ('F'|'D', line #)}, pp {player id: unit #}, dressed set, unmatched names, updated date."""
+    raw = dfo_lines(prof["team"])
+    if not raw:
+        return None
+    sk = prof["skaters"]
+    slot, pp, dressed, unmatched = {}, {}, set(), []
+    for key, size in (("F", 3), ("D", 2)):
+        for i, nm in enumerate(raw.get(key, [])[: 4 * size if key == "F" else 3 * size]):
+            pid = _match_name(nm, sk)
+            if pid is None:
+                unmatched.append(nm)
+                continue
+            slot[pid] = (key, i // size + 1)
+            dressed.add(pid)
+    for u in (1, 2):
+        for nm in raw.get(f"PP{u}", []):
+            pid = _match_name(nm, sk)
+            if pid is not None and pid not in pp:
+                pp[pid] = u
+    if len(dressed) < 12:      # too few matched players to trust it
+        return None
+    lines_named = dict(F=[raw["F"][i:i + 3] for i in range(0, min(len(raw["F"]), 12), 3)],
+                       D=[raw["D"][i:i + 2] for i in range(0, min(len(raw["D"]), 6), 2)],
+                       PP1=raw.get("PP1", []), PP2=raw.get("PP2", []), G=raw.get("G", []), IR=raw.get("IR", []))
+    return dict(slot=slot, pp=pp, dressed=dressed, unmatched=unmatched, updated=raw.get("updated", ""),
+                named=lines_named)
+
+
 def match_goalie(name, goalies):
     n = _norm(name)
     if not n:
@@ -2271,7 +2517,7 @@ def goalie_name(prof, gid):
 # --------------------------------------------------------------------------
 # Prediction tracker (GitHub when set up in Secrets, otherwise a local CSV)
 # --------------------------------------------------------------------------
-MODEL_VERSION = "v5-2026-11-15"
+MODEL_VERSION = "v6-2026-11-18"
 TRACK_COLS = ["game_id", "date", "start_utc", "away", "home", "away_goalie", "home_goalie", "goalie_status",
               "p_home", "proj_away", "proj_home", "p_ot", "likely", "sims", "n_recent", "model", "source",
               "saved_at", "ml_away", "ml_home", "total_line", "over_price", "under_price", "p_over_line",
@@ -2285,9 +2531,9 @@ PLAYER_COLS = ["game_id", "date", "start_utc", "team", "opp", "player_id", "play
 PLAYER_TEXT = ["date", "start_utc", "team", "opp", "player", "pos", "model", "saved_at", "status"]
 BET_COLS = ["bet_id", "placed_at", "date", "game_id", "start_utc", "game", "market", "selection", "team",
             "player_id", "player", "stat", "side", "line", "odds", "stake", "model_p", "book", "source",
-            "status", "profit", "result", "graded_at"]
+            "status", "profit", "result", "graded_at", "legs"]
 BET_TEXT = ["placed_at", "date", "start_utc", "game", "market", "selection", "team", "player", "stat", "side",
-            "book", "source", "status", "result", "graded_at"]
+            "book", "source", "status", "result", "graded_at", "legs"]
 STORES = {
     "games": dict(cols=TRACK_COLS, text=TRACK_TEXT, file="nhl_predictions.csv", secret="TRACKER_PATH"),
     "players": dict(cols=PLAYER_COLS, text=PLAYER_TEXT, file="nhl_player_predictions.csv", secret="PLAYER_TRACKER_PATH"),
@@ -2298,14 +2544,11 @@ LOCAL_TRACK = APP_DIR / STORES["games"]["file"]
 
 
 def _gh_conf(store="games"):
-    try:
-        token, repo = st.secrets.get("GITHUB_TOKEN"), st.secrets.get("GITHUB_REPO")
-        if token and repo:
-            info = STORES[store]
-            return dict(token=token, repo=repo, branch=st.secrets.get("TRACKER_BRANCH", "tracker-data"),
-                        path=st.secrets.get(info["secret"], info["file"]))
-    except Exception:
-        pass
+    token, repo = secret("GITHUB_TOKEN"), secret("GITHUB_REPO")
+    if token and repo:
+        info = STORES[store]
+        return dict(token=token, repo=repo, branch=secret("TRACKER_BRANCH", "tracker-data"),
+                    path=secret(info["secret"], info["file"]))
     return None
 
 
@@ -2420,6 +2663,9 @@ def _started(start_utc):
         return False
 
 
+ODDS_COLS = ["ml_away", "ml_home", "total_line", "over_price", "under_price", "p_over_line", "p_under_line"]
+
+
 def upsert_predictions(records, message):
     """Add or refresh predictions. Once a game has started its prediction is locked."""
     df = load_tracker().copy()
@@ -2432,6 +2678,8 @@ def upsert_predictions(records, message):
             row = df.loc[hit[0]]
             if pd.notna(row["final_home"]) or _started(row["start_utc"]):
                 continue
+            if pd.isna(rec.get("ml_home")) and pd.notna(row["ml_home"]):     # keep odds saved by an earlier run
+                rec = dict(rec, **{c: row[c] for c in ODDS_COLS})
             df = df.drop(hit)
         df = pd.concat([df, pd.DataFrame([rec])[TRACK_COLS]], ignore_index=True)
         changed += 1
@@ -2660,6 +2908,49 @@ def model_prob(res, market, team=None, side=None, line=None, player_id=None, sta
     return None, None
 
 
+def leg_outcome(res, leg):
+    """(win, push) boolean arrays over every simulated game for one bet leg (None if it can't be priced)."""
+    m, tot = res["margin"].astype(int), res["total"].astype(int)
+    mk, side, line = leg["market"], leg.get("side"), leg.get("line")
+    line = None if line is None or (isinstance(line, float) and np.isnan(line)) else float(line)
+
+    def ou(arr):
+        arr = np.asarray(arr).astype(float)
+        if side in ("Over", "Yes"):
+            return arr > line, arr == line
+        return arr < line, arr == line
+
+    if mk == "Moneyline":
+        return ((m > 0) if leg["team"] == res["home"] else (m < 0)), np.zeros(len(m), bool)
+    if mk == "Puck line":
+        tm = m if leg["team"] == res["home"] else -m
+        return tm + line > 0, tm + line == 0
+    if mk == "Total":
+        return ou(tot)
+    if mk == "Player":
+        pid = leg.get("player_id")
+        pid = None if pid is None or (isinstance(pid, float) and np.isnan(pid)) else int(pid)
+        if leg["stat"] == "Saves":
+            b = find_goalie(res, pid, leg.get("player"))
+            return ou(b["saves"]) if b is not None else None
+        b, i = find_player(res, pid, leg.get("player"))
+        return ou(stat_array(b, i, leg["stat"])) if b is not None else None
+    return None
+
+
+def parlay_prob(res, legs):
+    """Joint chance that every leg wins in the SAME simulated game (so legs that move together are
+    priced correctly), the chance if the legs were unrelated, and the push/void chance."""
+    outs = [leg_outcome(res, l) for l in legs]
+    if not outs or any(o is None for o in outs):
+        return None
+    win = np.logical_and.reduce([o[0] for o in outs])
+    lose_any = np.logical_or.reduce([~o[0] & ~o[1] for o in outs])
+    indep = float(np.prod([o[0].mean() for o in outs]))
+    return dict(joint=float(win.mean()), indep=indep, push=float((~win & ~lose_any).mean()),
+                legs=[float(o[0].mean()) for o in outs])
+
+
 def kelly(p, price):
     """Full-Kelly fraction of bankroll (0 if the bet has no edge)."""
     if p is None or price is None:
@@ -2769,6 +3060,8 @@ def add_bets(rows):
 
 
 def bet_label(r):
+    if r["market"] == "Parlay":
+        return " + ".join(bet_label(l) for l in parlay_legs(r))
     if r["market"] == "Moneyline":
         return f"{r['team']} moneyline"
     if r["market"] == "Puck line":
@@ -2778,8 +3071,31 @@ def bet_label(r):
     return f"{r['player']} {r['side']} {float(r['line']):g} {r['stat']}"
 
 
+def parlay_legs(r):
+    try:
+        legs = json.loads(r["legs"]) if isinstance(r.get("legs"), str) and r["legs"] else []
+    except Exception:
+        legs = []
+    for l in legs:
+        l.setdefault("game", r.get("game"))
+        for k in ("team", "side", "line", "player_id", "player", "stat"):
+            l.setdefault(k, None)
+    return legs
+
+
 def settle(r, final, box, ppp):
     """('Won'|'Lost'|'Push'|'Void', note) for one bet, given the final score and box score."""
+    if r["market"] == "Parlay":
+        res_ = [settle(l, final, box, ppp) for l in parlay_legs(r)]
+        stats = [x[0] for x in res_]
+        note = " · ".join(f"{'✅' if s_ == 'Won' else '❌' if s_ == 'Lost' else '➖'} {n}" for s_, n in res_)
+        if not stats:
+            return "Void", "No legs saved"
+        if "Lost" in stats:
+            return "Lost", note
+        if all(s_ == "Won" for s_ in stats):
+            return "Won", note
+        return "Void", note + " (a leg pushed or was void: books re-price these, so check your payout)"
     fa, fh, end = final
     margin, tot = fh - fa, fh + fa
     mk, side, line = r["market"], r["side"], (None if pd.isna(r["line"]) else float(r["line"]))
@@ -2843,13 +3159,207 @@ def grade_bets():
     return df, changed
 
 
+
+# --------------------------------------------------------------------------
+# Backtest: replay this season's finished games using only what was known before each one
+# --------------------------------------------------------------------------
+ALL_TEAMS = tuple(DFO_SLUG)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def season_games():
+    """[(game id, date, home, away)] for every finished regular-season game this season."""
+    def one(t):
+        try:
+            return fetch(f"club-schedule-season/{t}/now").get("games", [])
+        except Exception:
+            return []
+    seen = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for games in ex.map(one, ALL_TEAMS):
+            for g in games:
+                if g.get("gameType") == 2 and g.get("gameState") in ("OFF", "FINAL"):
+                    seen[g["id"]] = (g["id"], g.get("gameDate", ""), g["homeTeam"]["abbrev"], g["awayTeam"]["abbrev"])
+    return sorted(seen.values(), key=lambda r: (r[1], r[0]))
+
+
+def game_starters(g):
+    """{team id: starting goalie} for one slimmed game (first goalie to face a shot)."""
+    out = {}
+    for (t, per, typ, owner, *_rest, goalie) in g["plays"]:
+        if typ in ("shot-on-goal", "goal") and goalie:
+            other = g["away_id"] if owner == g["home_id"] else g["home_id"]
+            out.setdefault(other, goalie)
+        if len(out) == 2:
+            break
+    return out
+
+
+def asof_players(team, prior):
+    """Skater and goalie stats rebuilt from earlier game files only (nothing from later games)."""
+    sk, gk = {}, {}
+    for g in prior:
+        tid = g["home_id"] if g["home"] == team else g["away_id"]
+        info = g.get("rinfo") or {}
+        st_ = g.get("pstats") or {}
+        for pid, t_ in g["roster"]:
+            if t_ != tid:
+                continue
+            pos, name = info.get(pid, ("F", str(pid)))
+            if pos == "G":
+                gk.setdefault(pid, dict(id=pid, name=name, gp=0, gs=0, sa=0, ga=0))
+                continue
+            d = sk.setdefault(pid, dict(id=pid, name=name, pos=pos, gp=0, g=0, a=0, shots=0, ppp=0, pim=0))
+            d["gp"] += 1
+            v = st_.get(pid, [0, 0, 0, 0])
+            d["shots"] += v[0]
+            d["g"] += v[1]
+            d["a"] += v[2]
+            d["ppp"] += v[3]
+        starters = game_starters(g)
+        if tid in starters and starters[tid] in gk:
+            gk[starters[tid]]["gs"] += 1
+        played = set()
+        for (t, per, typ, owner, *_rest, goalie) in g["plays"]:
+            if typ in ("shot-on-goal", "goal") and owner != tid and goalie in gk:
+                gk[goalie]["sa"] += 1
+                gk[goalie]["ga"] += typ == "goal"
+                played.add(goalie)
+        for gid in played:
+            gk[gid]["gp"] += 1
+    skaters = []
+    for d in sk.values():
+        gp = max(d["gp"], 1)
+        d["toi"] = float(700 + 260 * (d["g"] + d["a"]) / gp + 110 * d["shots"] / gp + (420 if d["pos"] == "D" else 0))
+        skaters.append(d)
+    goalies = []
+    for d in gk.values():
+        d["saves"] = d["sa"] - d["ga"]
+        d["svp"] = d["saves"] / d["sa"] if d["sa"] else 0.0
+        goalies.append(d)
+    return skaters, goalies
+
+
+def _bt_context():
+    games = season_games()
+    pb = {g["id"]: g for g in fetch_pbps([r[0] for r in games])}
+    return games, pb
+
+
+def asof_profile(team, date, n_recent, games, pb):
+    prior = [pb[gid] for gid, d, h, a in games if d < date and team in (h, a) and gid in pb]
+    if not prior:
+        return None, 0
+    prof = _profile_core(team, prior[-n_recent:])
+    prof["skaters"], prof["goalies"] = asof_players(team, prior)
+    prof["asof"] = True
+    return prof, len(prior)
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False)
+def backtest_games(n_recent, min_prior=5, reps=800):
+    """Game-level backtest: for every finished game, the win chance and total-goals projection the model
+    would have made that morning (team style from earlier games only, the goalie who actually started)."""
+    games, pb = _bt_context()
+    meta, vecs_h, vecs_a, b2b = [], [], [], []
+    for gid, date, home, away in games:
+        g = pb.get(gid)
+        if g is None or g.get("home_score") is None:
+            continue
+        hp, nh = asof_profile(home, date, n_recent, games, pb)
+        ap, na = asof_profile(away, date, n_recent, games, pb)
+        if nh < min_prior or na < min_prior:
+            continue
+        shots = hp["shots_for"] + hp["shots_ag"] + ap["shots_for"] + ap["shots_ag"]
+        model = dist_model(np.array(shots, float)[:, 2], np.array(shots, float)[:, 3]) if shots else DIST_PRIOR.copy()
+        stt = game_starters(g)
+        vecs_h.append(team_vector(hp, model, stt.get(g["home_id"])))
+        vecs_a.append(team_vector(ap, model, stt.get(g["away_id"])))
+        b2b.append((is_b2b(hp, date), is_b2b(ap, date)))
+        meta.append(dict(game_id=gid, date=date, home=home, away=away, hs=int(g["home_score"]), as_=int(g["away_score"]),
+                         end="OT/SO" if any(p[1] >= 4 for p in g["plays"]) else "REG"))
+    if not meta:
+        return pd.DataFrame()
+    m = len(meta)
+    idx = np.repeat(np.arange(m), reps)
+    S = pair_sides(stack(vecs_h, idx), stack(vecs_a, idx))
+    bh = np.array([b[0] for b in b2b])[idx]
+    ba = np.array([b[1] for b in b2b])[idx]
+    for key in ("r_ev", "r_pp", "r_sh"):
+        f0 = np.where(bh, B2B_FOR, 1.0) * np.where(ba, B2B_AG, 1.0)
+        f1 = np.where(ba, B2B_FOR, 1.0) * np.where(bh, B2B_AG, 1.0)
+        S[0][key] = S[0][key] * (f0[:, None] if S[0][key].ndim == 2 else f0)
+        S[1][key] = S[1][key] * (f1[:, None] if S[1][key].ndim == 2 else f1)
+    gl = fast_reg(S, seed=11)
+    d = gl[:, 0] - gl[:, 1]
+    tie = d == 0
+    p_ot = ot_home_prob(S, False)
+    win = (d > 0) + tie * p_ot
+    tot = gl.sum(1) + tie            # overtime / shootout adds one goal for the winner
+    df = pd.DataFrame(meta)
+    df["p_home"] = win.reshape(m, reps).mean(1)
+    df["proj_total"] = tot.reshape(m, reps).mean(1)
+    df["p_over55"] = (tot > 5.5).reshape(m, reps).mean(1)
+    df["p_over65"] = (tot > 6.5).reshape(m, reps).mean(1)
+    df["p_ot"] = tie.reshape(m, reps).mean(1)
+    df["home_won"] = (df["hs"] > df["as_"]).astype(int)
+    df["total"] = df["hs"] + df["as_"]
+    return df
+
+
+@st.cache_data(ttl=6 * 3600, show_spinner=False, max_entries=2000)
+def backtest_players(gid, n_recent, n=600):
+    """Player-level backtest for one game: the full simulation with the lineups that actually dressed."""
+    games, pb = _bt_context()
+    row = next((r for r in games if r[0] == gid), None)
+    g = pb.get(gid)
+    if row is None or g is None:
+        return []
+    _, date, home, away = row
+    hp, nh = asof_profile(home, date, n_recent, games, pb)
+    ap, na = asof_profile(away, date, n_recent, games, pb)
+    if nh < 5 or na < 5:
+        return []
+    shots = hp["shots_for"] + hp["shots_ag"] + ap["shots_for"] + ap["shots_ag"]
+    model = dist_model(np.array(shots, float)[:, 2], np.array(shots, float)[:, 3]) if shots else DIST_PRIOR.copy()
+    stt = game_starters(g)
+    sides = []
+    for prof, opp, tid in ((hp, ap, g["home_id"]), (ap, hp, g["away_id"])):
+        dressed = {pid for pid, t_ in g["roster"] if t_ == tid}
+        out = tuple(s_["id"] for s_ in prof["skaters"] if s_["id"] not in dressed)
+        sides.append(build_side(prof, opp, stt.get(tid), out, model))
+    H, A = sides
+    for side, mult in ((H, 1 + HOME_EDGE), (A, 1 - HOME_EDGE)):
+        for key in ("r_ev", "r_pp", "r_sh"):
+            side[key] = side[key] * mult
+    r = simulate(H, A, n, seed=gid % 997, record=1)
+    actual = g.get("pstats") or {}
+    out_rows = []
+    for k, (side, prof) in enumerate(((H, hp), (A, ap))):
+        prior = {s_["id"]: s_ for s_ in prof["skaters"]}
+        for i, pid in enumerate(side["ids"]):
+            if pid not in {p for p, _ in g["roster"]}:
+                continue
+            G, A_, S_ = r["g_mat"][k][:, i], r["a_mat"][k][:, i], r["s_mat"][k][:, i]
+            pts = G + A_
+            v = actual.get(pid, [0, 0, 0, 0])
+            ps = prior.get(pid, {})
+            gp = max(ps.get("gp", 0), 1)
+            base_pt = 1 - math.exp(-(ps.get("g", 0) + ps.get("a", 0) + 0.4) / (gp + 1))   # simple season-average guess
+            out_rows.append(dict(game_id=gid, date=date, team=side["team"], player=side["names"][i],
+                                 p_point=float((pts > 0).mean()), p_goal=float((G > 0).mean()),
+                                 p_sog3=float((S_ >= 3).mean()), proj_sog=float(S_.mean()), proj_pts=float(pts.mean()),
+                                 base_point=base_pt, act_sog=v[0], act_g=v[1], act_a=v[2]))
+    return out_rows
+
+
 # ==========================================================================
 # APP  (multipage layout that works on phones and computers)
 # ==========================================================================
 ss = st.session_state
 PCFG = dict(displayModeBar=False, responsive=True)
 
-CSS = """<style>
+BASE_CSS = """<style>
 .block-container { padding-top: 3.6rem; padding-bottom: 4rem; max-width: 1400px; }
 @media (max-width: 640px) {
   .block-container { padding-left: .65rem; padding-right: .65rem; padding-top: 3.2rem; }
@@ -2862,10 +3372,13 @@ CSS = """<style>
 .kpi .l { font-size: .76rem; opacity: .72; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi .v { font-size: 1.3rem; font-weight: 800; line-height: 1.25; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .kpi .s { font-size: .74rem; opacity: .66; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.gc .tm { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 2px 0; font-weight: 700; font-size: 1.02rem; }
+.kpi.up .v { color: #00b85c; } .kpi.down .v { color: #e5484d; }
+.gc .tm { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 3px 0; font-weight: 700; font-size: 1.02rem; }
 .gc .tm span.n { display: flex; align-items: center; gap: 8px; }
+.gc .stripe { width: 4px; height: 26px; border-radius: 3px; display: inline-block; }
 .gc img { width: 30px; height: 30px; }
 .gc .num { font-weight: 800; font-variant-numeric: tabular-nums; }
+.gc .num.fav { color: #00b85c; }
 .gc .meta { font-size: .78rem; opacity: .72; margin-top: 4px; }
 .gc .bar { height: 7px; border-radius: 4px; overflow: hidden; display: flex; margin-top: 6px; background: rgba(128,128,128,.2); }
 .badge { display: inline-block; padding: 1px 8px; border-radius: 8px; font-size: .72rem; font-weight: 800; letter-spacing: .3px; }
@@ -2878,8 +3391,43 @@ CSS = """<style>
 .hero img { width: 46px; height: 46px; } .hero .at { opacity: .6; font-weight: 700; }
 .hero .ab { font-size: 1.5rem; font-weight: 900; }
 .small { font-size: .82rem; opacity: .8; }
+.lines { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 6px 14px; font-size: .86rem; }
+.lines .row { display: flex; gap: 8px; align-items: baseline; }
+.lines .tag { font-weight: 800; font-size: .72rem; min-width: 30px; opacity: .7; }
+.slip { border-radius: 14px; padding: 10px 14px; margin: 6px 0; background: rgba(128,128,128,.08); }
+.slip .leg { display: flex; justify-content: space-between; gap: 10px; padding: 3px 0; font-size: .92rem; }
+.slip .leg span:last-child { font-variant-numeric: tabular-nums; opacity: .85; }
 </style>"""
-st.markdown(CSS, unsafe_allow_html=True)
+
+DARK_CSS = """<style>
+.stApp { background: radial-gradient(1100px 520px at 12% -8%, #17244a 0%, rgba(11,18,32,0) 60%),
+                     radial-gradient(900px 480px at 100% 0%, #10302a 0%, rgba(11,18,32,0) 55%), #0b1220; }
+[data-testid="stHeader"] { background: rgba(11,18,32,.82); backdrop-filter: blur(10px); }
+h1, h2, h3, h4 { letter-spacing: .2px; }
+div[data-testid="stVerticalBlockBorderWrapper"], div[data-testid="stVerticalBlock"][class*="border"] {
+  background: linear-gradient(180deg, #131d34, #0f182c); border-color: #24304d !important;
+  box-shadow: 0 8px 22px rgba(0,0,0,.35); }
+.kpi { background: linear-gradient(180deg, #17223f, #111a30); border: 1px solid #22304d; box-shadow: 0 4px 14px rgba(0,0,0,.25); }
+.kpi .v { color: #ffffff; } .kpi.up .v { color: #00e676; } .kpi.down .v { color: #ff5c7a; }
+.gc .num.fav { color: #00e676; }
+.b-fut { background: rgba(79,195,255,.14); color: #4fc3ff; } .b-final { background: rgba(255,255,255,.1); color: #c8d3ea; }
+.b-ok { background: rgba(0,230,118,.14); color: #00e676; } .b-bad { background: rgba(255,92,122,.14); color: #ff5c7a; }
+.slip { background: linear-gradient(180deg, #17223f, #111a30); border: 1px solid #22304d; }
+.stTabs [data-baseweb="tab-list"] { gap: 4px; }
+.stTabs [aria-selected="true"] { color: #00e676 !important; }
+div[data-testid="stPopover"] button, .stButton button { font-weight: 700; }
+</style>"""
+
+
+def theme_is_dark():
+    try:
+        return (st.context.theme.type or "dark") == "dark"
+    except Exception:
+        return True
+
+
+LOGO_DARK = theme_is_dark()
+st.markdown(BASE_CSS + (DARK_CSS if LOGO_DARK else ""), unsafe_allow_html=True)
 
 
 def esc(x):
@@ -2887,9 +3435,11 @@ def esc(x):
 
 
 def kpis(items):
-    """Responsive stat tiles: 2 per row on a phone, up to 6 on a computer. items = (label, value, sub)."""
-    cells = "".join(f'<div class="kpi"><div class="l">{esc(l)}</div><div class="v">{esc(v)}</div>'
-                    + (f'<div class="s">{esc(s)}</div>' if s else "") + "</div>" for l, v, s in items)
+    """Responsive stat tiles: 2 per row on a phone, up to 6 on a computer.
+    items = (label, value, sub) or (label, value, sub, 'up'|'down')."""
+    cells = "".join(f'<div class="kpi {it[3] if len(it) > 3 else ""}"><div class="l">{esc(it[0])}</div>'
+                    f'<div class="v">{esc(it[1])}</div>' + (f'<div class="s">{esc(it[2])}</div>' if it[2] else "") + "</div>"
+                    for it in items)
     st.markdown(f'<div class="kgrid">{cells}</div>', unsafe_allow_html=True)
 
 
@@ -2901,6 +3451,8 @@ def chart(fig, key, height=None):
 
 
 def local_tz():
+    if os.environ.get("NHL_TZ"):
+        return os.environ["NHL_TZ"]
     try:
         tz = st.context.timezone
         if tz:
@@ -2960,7 +3512,7 @@ def _label(t):
 
 
 # Settings that survive switching pages
-for k, v in (("n_sims", 5000), ("n_recent", 15), ("playoff", False), ("bankroll", 1000.0),
+for k, v in (("n_sims", 5000), ("n_recent", 15), ("playoff", False), ("bankroll", 1000.0), ("use_lines", True),
              ("home", "SEA" if "SEA" in TEAMS else TEAMS[0]), ("away", "VAN" if "VAN" in TEAMS else TEAMS[1]),
              ("day", local_today())):
     ss.setdefault(k, v)
@@ -2984,6 +3536,12 @@ def settings_popover():
                   help="Newer games count more (a game 10 games ago counts half as much as the last one).")
         st.toggle("Playoff rules (sudden-death 5-on-5 OT, no shootout)", value=ss["playoff"], key="_w_playoff",
                   on_change=_keep, args=("playoff",))
+        st.toggle("Use DailyFaceoff line combinations", value=ss["use_lines"], key="_w_use_lines",
+                  on_change=_keep, args=("use_lines",),
+                  help="Tonight's projected lines and power-play units decide who dresses, who gets more ice time "
+                       "and who is on the power play. Off = usual lineups from recent games.")
+        if not theme_is_dark():
+            st.caption("🌙 For the dark look, choose Dark under ⋮ → Settings, or add the .streamlit/config.toml file.")
         st.caption("Data: NHL public API · refreshes every 30 min (live scores every 45 s).")
 
 
@@ -3005,8 +3563,8 @@ def odds_key_input(where):
 
 
 def team_hero(away, home, sub=""):
-    st.markdown(f'<div class="hero"><img src="{logo_url(away)}"><span class="ab">{away}</span>'
-                f'<span class="at">@</span><span class="ab">{home}</span><img src="{logo_url(home)}"></div>'
+    st.markdown(f'<div class="hero"><img src="{logo_url(away, LOGO_DARK)}"><span class="ab">{away}</span>'
+                f'<span class="at">@</span><span class="ab">{home}</span><img src="{logo_url(home, LOGO_DARK)}"></div>'
                 + (f'<div class="small" style="text-align:center">{sub}</div>' if sub else ""),
                 unsafe_allow_html=True)
 
@@ -3025,17 +3583,18 @@ def matchup_inputs(home, away):
     else:
         ng = next_game(home, away)
     gs = starting_goalies(home, away, ng["date"] if ng else None, hp, ap)
-    key = f"lu_{away}_{home}"
+    key = f"lu_{away}_{home}_{int(bool(ss.get('use_lines', True)))}"
     ov = ss.get(key, {})
+    ul = ss.get("use_lines", True)
     return dict(home=home, away=away, hp=hp, ap=ap, ng=ng, gs=gs, key=key,
                 hg=ov.get("hg", gs["home"][0]), ag=ov.get("ag", gs["away"][0]),
-                ho=ov.get("ho", default_lineup(hp)[1]), ao=ov.get("ao", default_lineup(ap)[1]))
+                ho=ov.get("ho", default_lineup(hp, ul)[1]), ao=ov.get("ao", default_lineup(ap, ul)[1]))
 
 
 def sim_for(mi, n=None):
     playoff = bool(ss["playoff"] or (mi["ng"] and mi["ng"].get("playoff")))
     return run_matchup(mi["home"], mi["away"], mi["hg"], mi["ag"], mi["ho"], mi["ao"], n or ss["n_sims"], playoff,
-                       ss["n_recent"], None, mi["ng"]["date"] if mi["ng"] else None)
+                       ss["n_recent"], None, mi["ng"]["date"] if mi["ng"] else None, ss["use_lines"])
 
 
 def sim_game(g, day_str, n):
@@ -3043,8 +3602,9 @@ def sim_game(g, day_str, n):
     h, a = g["homeTeam"]["abbrev"], g["awayTeam"]["abbrev"]
     hpp, app = build_profile(h, ss["n_recent"]), build_profile(a, ss["n_recent"])
     gs = starting_goalies(h, a, day_str, hpp, app)
-    res = run_matchup(h, a, gs["home"][0], gs["away"][0], default_lineup(hpp)[1], default_lineup(app)[1], n,
-                      g.get("gameType") == 3, ss["n_recent"], None, day_str)
+    ul = ss.get("use_lines", True)
+    res = run_matchup(h, a, gs["home"][0], gs["away"][0], default_lineup(hpp, ul)[1], default_lineup(app, ul)[1], n,
+                      g.get("gameType") == 3, ss["n_recent"], None, day_str, ul)
     return res, gs, hpp, app
 
 
@@ -3147,10 +3707,16 @@ def game_card(g, live, sim, day_str):
             return f"{100 * (p_home if side == 'h' else 1 - p_home):.0f}%"
         return ""
 
+    def fav(side):
+        if state in ("LIVE", "CRIT", "OFF", "FINAL") and hs is not None:
+            return (hs > as_) if side == "h" else (as_ > hs)
+        return p_home is not None and ((p_home >= 0.5) if side == "h" else (p_home < 0.5))
+
     rows = "".join(
-        f'<div class="tm"><span class="n"><img src="{logo_url(t)}" alt="">{t}'
+        f'<div class="tm"><span class="n"><span class="stripe" style="background:{col}"></span>'
+        f'<img src="{logo_url(t, LOGO_DARK)}" alt="">{t}'
         f'<span class="small" style="font-weight:400">{esc(NAMES.get(t, "").split()[-1] if NAMES.get(t) else "")}</span></span>'
-        f'<span class="num">{num(sd)}</span></div>' for t, sd in ((a, "a"), (h, "h")))
+        f'<span class="num{" fav" if fav(sd) else ""}">{num(sd)}</span></div>' for t, sd, col in ((a, "a", ca), (h, "h", ch)))
     bar = ""
     if p_home is not None:
         bar = (f'<div class="bar"><div style="width:{100 * (1 - p_home):.1f}%;background:{ca}"></div>'
@@ -3255,7 +3821,7 @@ def lineup_controls(prof, side, gs, cur_goalie, cur_out):
         ids = [g["id"] for g in gk]
         goalie = st.selectbox(
             "Starting goalie", ids, index=ids.index(cur_goalie) if cur_goalie in ids else 0,
-            key=f"gk_{side}_{prof['team']}",
+            key=f"gk_{side}_{prof['team']}_{int(bool(ss['use_lines']))}",
             format_func=lambda i: next(f"{g['name']}  ({g['svp']:.3f} SV%, {g['gp']} GP)" for g in gk if g["id"] == i))
         st.caption(("✏️ Your pick" if goalie != g_def else GOALIE_ICON.get(g_status, g_status))
                    + (f" · {g_note}" if g_note else ""))
@@ -3263,10 +3829,32 @@ def lineup_controls(prof, side, gs, cur_goalie, cur_out):
         st.caption("No goalie stats yet – using league average.")
     names = {s["id"]: f"{s['name']} ({s['pos']}, {s['g']}G {s['a']}A)" for s in prof["skaters"]}
     out = st.multiselect("Out tonight (injured / scratched)", list(names), default=[i for i in cur_out if i in names],
-                         key=f"out_{side}_{prof['team']}", format_func=lambda i: names[i],
-                         help="Pre-filled with players who weren't in the last two lineups. Remove a name to bring "
+                         key=f"out_{side}_{prof['team']}_{int(bool(ss['use_lines']))}", format_func=lambda i: names[i],
+                         help="Pre-filled with players who aren't in tonight's DailyFaceoff lines (or, without lines, "
+                              "who weren't in the last two lineups). Remove a name to bring "
                               "a player back; add a name to sit him.")
     return goalie, tuple(sorted(out))
+
+
+def lines_html(prof):
+    """Tonight's DailyFaceoff lines for one team as compact HTML (empty string if unavailable)."""
+    tl = team_lines(prof) if ss.get("use_lines", True) else None
+    if not tl:
+        return ""
+    nm = tl["named"]
+    last = lambda n: esc(n.split()[-1]) if n else ""
+    rows = [f'<div class="row"><span class="tag">L{i + 1}</span>{" – ".join(last(x) for x in trio)}</div>'
+            for i, trio in enumerate(nm["F"])]
+    rows += [f'<div class="row"><span class="tag">D{i + 1}</span>{" – ".join(last(x) for x in pair)}</div>'
+             for i, pair in enumerate(nm["D"])]
+    for u in ("PP1", "PP2"):
+        if nm.get(u):
+            rows.append(f'<div class="row"><span class="tag">{u}</span>{", ".join(last(x) for x in nm[u])}</div>')
+    if nm.get("IR"):
+        rows.append(f'<div class="row"><span class="tag">OUT</span>{", ".join(esc(x) for x in nm["IR"])}</div>')
+    extra = f" · couldn't match: {', '.join(tl['unmatched'])}" if tl["unmatched"] else ""
+    return (f'<div class="small" style="margin:4px 0 2px">📋 DailyFaceoff lines · updated {esc(tl["updated"] or "recently")}'
+            f'{esc(extra)}</div><div class="lines">{"".join(rows)}</div>')
 
 
 def headshots(*profs):
@@ -3333,8 +3921,10 @@ def page_game():
         l1, l2 = st.columns(2)
         with l1:
             ag, ao = lineup_controls(mi["ap"], "away", mi["gs"]["away"], mi["ag"], mi["ao"])
+            st.markdown(lines_html(mi["ap"]), unsafe_allow_html=True)
         with l2:
             hg, ho = lineup_controls(mi["hp"], "home", mi["gs"]["home"], mi["hg"], mi["ho"])
+            st.markdown(lines_html(mi["hp"]), unsafe_allow_html=True)
         ss[mi["key"]] = dict(hg=hg, ag=ag, ho=ho, ao=ao)
         mi.update(hg=hg, ag=ag, ho=ho, ao=ao)
         if st.button("↺ Back to confirmed goalies & usual lineups", key="lu_reset"):
@@ -3356,6 +3946,8 @@ def page_game():
     team_hero(away, home, f"{when}<br>🥅 {esc(goalie_name(mi['ap'], mi['ag']))} {SHORT_ICON.get(a_st, '')} vs "
                           f"{esc(goalie_name(mi['hp'], mi['hg']))} {SHORT_ICON.get(h_st, '')}"
                           + (f" · 😴 {', '.join(tired)} on a back-to-back" if tired else "")
+                          + ("<br>📋 Lines: DailyFaceoff" if any((res.get("lines") or {}).values()) else
+                             ("<br>📋 Lines: usual lineups (DailyFaceoff lines unavailable)" if ss["use_lines"] else ""))
                           + ("<br>🏆 Playoff rules" if res.get("playoff") else ""))
     s0 = res["top_scores"][0]
     tot = res["total"]
@@ -3584,7 +4176,7 @@ def player_card_ui(res, hp, ap, where, preselect=None):
             fig = go.Figure(go.Bar(x=[f"{d[5:]} {o_}" for d, o_, _ in rv], y=[v for *_, v in rv],
                                    marker_color=["#27ae60" if v > line else "#c0392b" for *_, v in rv],
                                    text=[v for *_, v in rv], textposition="outside", cliponaxis=False))
-            fig.add_hline(y=line, line=dict(color="#555", dash="dot"))
+            fig.add_hline(y=line, line=dict(color="#8ea0c4", dash="dot"))
             fig.update_layout(yaxis_title=stat, margin=dict(t=6), xaxis=dict(tickangle=-45, tickfont=dict(size=10)))
             chart(fig, f"pc_log_{where}", 260)
         else:
@@ -3701,11 +4293,8 @@ def ev_per100(p, push, price):
     return p * payout(price) - (1 - p - (push or 0)) * 100
 
 
-def bet_logger(res, game, where):
-    """Log a bet you placed (or are thinking about) and see what the model thinks of it."""
-    if not game:
-        st.info("This matchup isn't on the schedule, so bets on it can't be graded.")
-        return
+def leg_form(res, where):
+    """Pick one bet on this game (market, team/side, line, player). Returns a leg dict."""
     home, away = res["home"], res["away"]
     mk = st.segmented_control("Market", ["Moneyline", "Puck line", "Total", "Player prop"], default="Moneyline",
                               key=f"bl_mk_{where}") or "Moneyline"
@@ -3736,9 +4325,19 @@ def bet_logger(res, game, where):
         side = c3.radio("Side", ["Over", "Under"], horizontal=True, key=f"bl_s2_{where}")
         dflt = 24.5 if stat == "Saves" else (2.5 if stat == "SOG" else 0.5)
         ln = c3.number_input("Line", 0.5, 60.5, dflt, 1.0, key=f"bl_l_{where}_{stat}")
-        kw = dict(market="Player", side=side, line=ln, stat=stat,
-                  player_id=b.get("goalie_id") if kind == "G" else b["ids"][i],
+        pid = b.get("goalie_id") if kind == "G" else b["ids"][i]
+        kw = dict(market="Player", side=side, line=float(ln), stat=stat,
+                  player_id=None if pid is None else int(pid),
                   player=b["goalie"] if kind == "G" else b["names"][i], team=b["team"])
+    return kw
+
+
+def bet_logger(res, game, where):
+    """Log a bet you placed (or are thinking about) and see what the model thinks of it."""
+    if not game:
+        st.info("This matchup isn't on the schedule, so bets on it can't be graded.")
+        return
+    kw = leg_form(res, where)
     d1, d2, d3 = st.columns(3)
     odds = d1.number_input("Odds (American)", -10000, 10000, -110, 5, key=f"bl_o_{where}")
     stake = d2.number_input("Stake ($)", 0.0, 100000.0, 10.0, 5.0, key=f"bl_k_{where}")
@@ -3761,6 +4360,113 @@ def bet_logger(res, game, where):
             st.success("Logged. It will be graded automatically after the game (📈 on the 💰 Bets page).")
         except Exception as e:
             st.error(f"Couldn't save the bet ({e}).")
+
+
+def best_combos(res, top=8):
+    """Two-leg combos where the legs help each other: a team winning + one of its players getting a point
+    (or a goal), and the total going over + a player's point."""
+    rows = []
+    m = res["margin"]
+    for k, b in enumerate(res["props"]):
+        team = b["team"]
+        win = (m > 0) if team == res["home"] else (m < 0)
+        pts = b["G"].astype(np.int16) + b["A"]
+        for i in np.argsort(-pts.mean(0))[:5]:
+            for stat, arr in (("Points", pts[:, i] > 0), ("Goals", b["G"][:, i] > 0)):
+                joint = float((win & arr).mean())
+                indep = float(win.mean() * arr.mean())
+                if joint > 0.05:
+                    rows.append({"Combo": f"{team} win + {b['names'][i]} {'1+ point' if stat == 'Points' else 'to score'}",
+                                 "Chance": 100 * joint, "Fair odds": american(joint), "If unrelated": american(indep),
+                                 "Boost": joint / indep if indep else 1.0,
+                                 "_legs": [dict(market="Moneyline", team=team),
+                                           dict(market="Player", player_id=int(b["ids"][i]), player=b["names"][i],
+                                                stat=stat, side="Over", line=0.5, team=team)]})
+    rows.sort(key=lambda r: -r["Boost"] * r["Chance"])
+    return rows[:top]
+
+
+def parlay_builder(res, game, where):
+    """Same-game parlay: legs are priced together from the same simulated games."""
+    key = f"parlay_{where}_{res['away']}_{res['home']}"
+    legs = ss.setdefault(key, [])
+    st.caption("Adds up the chance that every leg hits in the same simulated game, so legs that go together "
+               "(a team winning and its top scorer getting a point) are priced correctly instead of just multiplied.")
+    combos = best_combos(res)
+    if combos:
+        with st.expander("💡 Combos where the legs help each other"):
+            view = pd.DataFrame([{k: v for k, v in c.items() if k != "_legs"} for c in combos])
+            ev_ = st.dataframe(view, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row",
+                               key=f"combo_{key}", column_config={
+                                   "Chance": st.column_config.NumberColumn(format="%.1f%%"),
+                                   "Boost": st.column_config.NumberColumn("Boost vs unrelated", format="%.2f×")})
+            sel = ev_.selection.rows if ev_ and hasattr(ev_, "selection") else []
+            if sel and st.button("Load this combo into the parlay", key=f"combo_load_{key}"):
+                ss[key] = [dict(l) for l in combos[sel[0]]["_legs"]]
+                st.rerun()
+    with st.container(border=True):
+        st.markdown("**Add a leg**")
+        leg = leg_form(res, f"{where}_pl")
+        c1, c2 = st.columns(2)
+        if c1.button("➕ Add leg", key=f"pl_add_{key}", width="stretch"):
+            if leg not in legs:
+                legs.append(leg)
+            st.rerun()
+        if legs and c2.button("🗑️ Clear parlay", key=f"pl_clear_{key}", width="stretch"):
+            ss[key] = []
+            st.rerun()
+    if not legs:
+        st.caption("Add two or more legs to price a parlay.")
+        return
+    pr = parlay_prob(res, legs)
+    if pr is None:
+        st.warning("One of the legs can't be priced (player isn't in the simulated lineup). Clear it and try again.")
+        return
+    slip = "".join(f'<div class="leg"><span>{esc(bet_label(dict(l, game=f"{res["away"]} @ {res["home"]}")))}</span>'
+                   f'<span>{pct1(p)}</span></div>' for l, p in zip(legs, pr["legs"]))
+    st.markdown(f'<div class="slip"><div class="small" style="margin-bottom:4px">🧾 Parlay · {len(legs)} legs</div>'
+                f'{slip}</div>', unsafe_allow_html=True)
+    rm = st.pills("Remove a leg", [f"{i + 1}" for i in range(len(legs))], key=f"pl_rm_{key}_{len(legs)}",
+                  label_visibility="collapsed") if len(legs) > 1 else None
+    if rm:
+        legs.pop(int(rm) - 1)
+        st.rerun()
+    boost = pr["joint"] / pr["indep"] if pr["indep"] else 1.0
+    kpis([("Parlay hits", pct1(pr["joint"]), f"fair odds {american(pr['joint'])}", "up" if boost > 1.05 else ""),
+          ("If legs were unrelated", pct1(pr["indep"]), f"fair odds {american(pr['indep'])}"),
+          ("Legs work together", f"{boost:.2f}×", "above 1 = they help each other", "up" if boost > 1.05 else
+           ("down" if boost < 0.95 else ""))])
+    if not game:
+        st.info("This matchup isn't on the schedule, so a parlay on it can't be graded.")
+        return
+    d1, d2, d3 = st.columns(3)
+    odds = d1.number_input("Sportsbook's parlay odds", -10000, 100000, 300, 10, key=f"pl_o_{key}")
+    stake = d2.number_input("Stake ($)", 0.0, 100000.0, 10.0, 5.0, key=f"pl_k_{key}")
+    book = d3.text_input("Sportsbook (optional)", key=f"pl_b_{key}")
+    if -100 < odds < 100:
+        st.warning("American odds are +100 or higher, or -100 or lower.")
+        return
+    ev = ev_per100(pr["joint"], pr["push"], odds)
+    kpis([("Book's implied", pct1(implied(odds)), "with margin"),
+          ("Expected profit", money(ev), "per $100 bet", "up" if ev > 0 else "down"),
+          ("¼-Kelly stake", f"${kelly(pr['joint'], odds) * 0.25 * ss['bankroll']:,.0f}", f"bankroll ${ss['bankroll']:,.0f}")])
+    clean = [{k: (int(v) if isinstance(v, np.integer) else float(v) if isinstance(v, np.floating) else v)
+              for k, v in l.items()} for l in legs]
+    row = dict(date=game["date"], game_id=int(game["id"]), start_utc=game.get("start", ""),
+               game=f"{away_home(res)}", market="Parlay", legs=json.dumps(clean), odds=int(odds), stake=float(stake),
+               model_p=round(pr["joint"], 4), book=book, source="parlay")
+    row["selection"] = bet_label(row)
+    if st.button(f"➕ Add this {len(legs)}-leg parlay to My Bets", type="primary", key=f"pl_log_{key}"):
+        try:
+            add_bets([row])
+            ss[key] = []
+            st.success("Parlay logged. It's graded leg by leg after the game.")
+        except Exception as e:
+            st.error(f"Couldn't save the parlay ({e}).")
+
+
+def away_home(res):
+    return f"{res['away']} @ {res['home']}"
 
 
 def edge_table(rows, where, game):
@@ -3909,6 +4615,8 @@ def game_odds_ui(res, ng, mi):
         st.caption("Add a free API key to compare the model with real sportsbook prices for game lines and player props.")
     st.markdown("**✍️ Log a bet on this game**")
     bet_logger(res, game, "gc")
+    st.markdown("#### 🧩 Same-game parlay builder")
+    parlay_builder(res, game, "gc")
 
 
 # ==========================================================================
@@ -3962,7 +4670,12 @@ def page_bets():
                 with st.spinner("Simulating this game…"):
                     res = sim_game(g, day_str, min(ss["n_sims"], 3000))[0]
                 game = dict(id=g["id"], date=day_str, start=g.get("startTimeUTC", ""))
-            bet_logger(res, game, "bp")
+            kind = st.segmented_control("Bet type", ["Single bet", "Same-game parlay"], default="Single bet",
+                                        key="bp_kind") or "Single bet"
+            if kind == "Single bet":
+                bet_logger(res, game, "bp")
+            else:
+                parlay_builder(res, game, "bp")
         except Exception as e:
             st.error(f"Couldn't simulate that game ({e}).")
 
@@ -4005,7 +4718,7 @@ def page_bets():
             fig = go.Figure(go.Scatter(x=list(range(1, len(d) + 1)), y=d["profit"].cumsum(), mode="lines+markers",
                                        line=dict(width=3, color="#27ae60" if profit >= 0 else "#c0392b"),
                                        hovertext=d["game"] + " · " + d["selection"], hoverinfo="text+y"))
-            fig.add_hline(y=0, line=dict(color="#999", dash="dot"))
+            fig.add_hline(y=0, line=dict(color="#8ea0c4", dash="dot"))
             fig.update_layout(xaxis_title="Bet number", yaxis_title="Running profit ($)", margin=dict(t=10))
             chart(fig, "my_profit", 300)
             d["Market"] = d.apply(market_group, axis=1)
@@ -4129,7 +4842,7 @@ def page_tracker():
                 st.info("No NHL games today.")
         except Exception as e:
             st.error(f"Couldn't run today's games ({e}).")
-    t_g, t_p, t_m = st.tabs(["🏒 Games", "⛸️ Players", "🤖 Model's bets"])
+    t_g, t_p, t_m, t_bt = st.tabs(["🏒 Games", "⛸️ Players", "🤖 Model's bets", "🧪 Test on past games"])
     try:
         tdf, newly = grade_tracker()
         if newly:
@@ -4252,9 +4965,12 @@ def page_tracker():
                 fig = go.Figure(go.Scatter(x=list(range(1, len(curve) + 1)), y=curve["profit"].cumsum(), mode="lines",
                                            line=dict(width=3, color="#27ae60" if pr >= 0 else "#c0392b"),
                                            hovertext=curve["game"] + " · " + curve["bet"], hoverinfo="text+y"))
-                fig.add_hline(y=0, line=dict(color="#999", dash="dot"))
+                fig.add_hline(y=0, line=dict(color="#8ea0c4", dash="dot"))
                 fig.update_layout(xaxis_title="Bet number", yaxis_title="Running profit ($)", margin=dict(t=10))
                 chart(fig, "paper_curve", 280)
+
+    with t_bt:
+        backtest_ui()
 
     with st.expander("☁️ Keep your data on Streamlit Cloud (one-time GitHub setup)"):
         st.markdown('''
@@ -4273,6 +4989,107 @@ ODDS_API_KEY = "optional-your-odds-api-key"
 ```
 Everything is saved on a separate branch called `tracker-data`, so saving never restarts your app.
 ''')
+
+
+def backtest_ui():
+    st.markdown("**How would the model have done on games already played?**")
+    st.caption("Replays every finished game this season the way the model would have seen it that morning: each "
+               "team's style comes only from its earlier games, player and goalie numbers are rebuilt from earlier "
+               "games only, and the goalie who actually started is used. Nothing from later games leaks in. "
+               "A team needs 5 earlier games before its games are tested.")
+    if st.button("🧪 Run the test", type="primary", key="bt_run"):
+        ss["bt_on"] = True
+    if not ss.get("bt_on"):
+        st.info("Takes about a minute the first time (it downloads every game this season), then it's cached.")
+        return
+    with st.spinner("Replaying this season's games…"):
+        try:
+            df = backtest_games(ss["n_recent"])
+        except Exception as e:
+            st.error(f"Couldn't run the test ({e}).")
+            return
+    if df.empty:
+        st.info("Not enough finished games yet (each team needs 5).")
+        return
+    df = df.copy()
+    pick_home = df["p_home"] >= 0.5
+    correct = pick_home == (df["home_won"] == 1)
+    brier = float(((df["p_home"] - df["home_won"]) ** 2).mean())
+    base_p = float(df["home_won"].mean())
+    base_brier = float(((base_p - df["home_won"]) ** 2).mean())
+    conf = df[(df["p_home"] >= 0.6) | (df["p_home"] <= 0.4)]
+    conf_ok = ((conf["p_home"] >= 0.5) == (conf["home_won"] == 1))
+    tot_mae = float((df["proj_total"] - df["total"]).abs().mean())
+    kpis([("Games tested", f"{len(df)}", f"{df['date'].min()} → {df['date'].max()}"),
+          ("Winner picked", f"{100 * correct.mean():.1f}%", f"{int(correct.sum())}-{int((~correct).sum())}",
+           "up" if correct.mean() > 0.55 else ""),
+          ("Brier score", f"{brier:.3f}", f"always-home guess: {base_brier:.3f}", "up" if brier < base_brier else "down"),
+          ("Confident picks (60%+)", f"{100 * conf_ok.mean():.0f}%" if len(conf) else "–", f"{len(conf)} games"),
+          ("Total goals miss", f"{tot_mae:.2f}", f"avg {df['proj_total'].mean():.2f} proj vs {df['total'].mean():.2f} real")])
+    c1, c2 = st.columns(2)
+    with c1:
+        p_pick = np.where(pick_home, df["p_home"], 1 - df["p_home"])
+        calib_chart(p_pick, correct.astype(float).to_numpy(), "bt_cal", "Are the win chances honest?",
+                    bins=(0.5, 0.55, 0.6, 0.65, 0.7, 1.01))
+    with c2:
+        dd = df.sort_values("date").reset_index(drop=True)
+        dd["acc"] = (((dd["p_home"] >= 0.5) == (dd["home_won"] == 1)).astype(float)).expanding().mean() * 100
+        fig = go.Figure(go.Scatter(x=list(range(1, len(dd) + 1)), y=dd["acc"], mode="lines",
+                                   line=dict(width=3, color="#00d26a")))
+        fig.add_hline(y=50, line=dict(color="#8ea0c4", dash="dot"))
+        fig.update_layout(title="Winner-picking accuracy as the season went on", xaxis_title="Games tested",
+                          yaxis_title="% correct", margin=dict(t=40), yaxis=dict(range=[30, 80]))
+        chart(fig, "bt_acc", 300)
+    over = (df["total"] > 6.5).astype(float)
+    calib_chart(df["p_over65"], over.to_numpy(), "bt_over", "Over 6.5 goals: are the chances honest?")
+    st.markdown("**Every tested game**")
+    view = df.sort_values("date", ascending=False)
+    st.dataframe(pd.DataFrame({
+        "": np.where(((view["p_home"] >= 0.5) == (view["home_won"] == 1)), "✅", "❌"), "Date": view["date"],
+        "Game": view["away"] + " @ " + view["home"],
+        "Pick": np.where(view["p_home"] >= 0.5, view["home"], view["away"]) + " " +
+                (np.maximum(view["p_home"], 1 - view["p_home"]) * 100).round(0).astype(int).astype(str) + "%",
+        "Final": view["away"] + " " + view["as_"].astype(str) + " – " + view["hs"].astype(str) + " " + view["home"],
+        "Proj total": view["proj_total"], "Real total": view["total"]}),
+        hide_index=True, width="stretch", height=360,
+        column_config={"Proj total": st.column_config.NumberColumn(format="%.1f")})
+    st.caption("This can't show betting profit: past sportsbook odds aren't available on the free odds plan. "
+               "It shows whether the model's chances match what happened, which is what makes the edges trustworthy.")
+
+    st.markdown("**Player props on the most recent games**")
+    k = st.select_slider("Games to test (full simulation of each)", [25, 50, 100, 200], value=50, key="bt_np")
+    if st.button(f"⛸️ Test player props on the last {k} games", key="bt_players"):
+        ss["bt_players_k"] = k
+    kk = ss.get("bt_players_k")
+    if kk:
+        ids = df.sort_values("date")["game_id"].tolist()[-kk:]
+        rows = []
+        bar = st.progress(0.0, text="Simulating player stats…")
+        for j, gid in enumerate(ids):
+            try:
+                rows += backtest_players(int(gid), ss["n_recent"])
+            except Exception:
+                pass
+            bar.progress((j + 1) / len(ids))
+        bar.empty()
+        pdf = pd.DataFrame(rows)
+        if pdf.empty:
+            st.info("No player results.")
+            return
+        hit = ((pdf["act_g"] + pdf["act_a"]) > 0).astype(float)
+        b_model = float(((pdf["p_point"] - hit) ** 2).mean())
+        b_base = float(((pdf["base_point"] - hit) ** 2).mean())
+        kpis([("Player-games", f"{len(pdf)}", f"{pdf['game_id'].nunique()} games"),
+              ("1+ point Brier", f"{b_model:.3f}", f"season-average guess: {b_base:.3f}", "up" if b_model < b_base else "down"),
+              ("Shots: avg miss", f"{(pdf['proj_sog'] - pdf['act_sog']).abs().mean():.2f}",
+               f"bias {(pdf['proj_sog'] - pdf['act_sog']).mean():+.2f}"),
+              ("Points: avg miss", f"{(pdf['proj_pts'] - pdf['act_g'] - pdf['act_a']).abs().mean():.2f}", "")])
+        which = st.segmented_control("Check", ["1+ point", "Anytime goal", "3+ shots"], default="1+ point",
+                                     key="bt_which") or "1+ point"
+        col, h2 = {"1+ point": ("p_point", hit), "Anytime goal": ("p_goal", (pdf["act_g"] > 0).astype(float)),
+                   "3+ shots": ("p_sog3", (pdf["act_sog"] >= 3).astype(float))}[which]
+        calib_chart(pdf[col], h2.to_numpy(), "bt_pcal", f"{which}: are the chances honest?")
+        st.caption("Uses the players who actually dressed and the starting goalie, like a lineup confirmed at warmups.")
 
 
 # ==========================================================================
@@ -4422,13 +5239,13 @@ def page_teams():
             chart(shot_map(prof, "for", color), f"map_for_{team}")
         with c2:
             st.markdown("**Where opponents shoot from**")
-            chart(shot_map(prof, "against", "#555555"), f"map_ag_{team}")
+            chart(shot_map(prof, "against", "#5b6b8c"), f"map_ag_{team}")
         lab = ["Leading", "Tied", "Trailing", "Power play", "Shorthanded"]
         fig = go.Figure()
         fig.add_trace(go.Bar(x=lab, y=[prof["r_for"][s] for s in STATES], name="Shots for /60", marker_color=color))
-        fig.add_trace(go.Bar(x=lab, y=[prof["r_ag"][s] for s in STATES], name="Shots against /60", marker_color="#999"))
+        fig.add_trace(go.Bar(x=lab, y=[prof["r_ag"][s] for s in STATES], name="Shots against /60", marker_color="#8ea0c4"))
         fig.add_trace(go.Scatter(x=lab, y=[LG_RATE[s] for s in STATES], mode="markers", name="League avg",
-                                 marker=dict(symbol="line-ew-open", size=28, color="black", line=dict(width=3))))
+                                 marker=dict(symbol="line-ew-open", size=28, color="#ffd84d", line=dict(width=3))))
         fig.update_layout(barmode="group", title="Shot rates by game state", margin=dict(t=40),
                           legend=dict(orientation="h", y=-0.25))
         chart(fig, f"rates_{team}", 330)
@@ -4452,6 +5269,40 @@ def page_teams():
                     st.markdown(f"**{d}**")
                     st.dataframe(view[view["Div"] == d].sort_values("PTS", ascending=False)[cols], hide_index=True,
                                  width="stretch", column_config=cfg)
+
+
+# ==========================================================================
+# Daily auto-save (run by the GitHub robot: NHL_AUTOSAVE=1 python nhl_app.py)
+# ==========================================================================
+def autosave():
+    print(f"NHL auto-save · {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M} UTC · storage: "
+          f"{'GitHub ' + _gh_conf()['repo'] if _gh_conf() else 'local files'}")
+    for name, fn in (("games", grade_tracker), ("players", grade_players), ("bets", grade_bets)):
+        try:
+            print(f"  graded {fn()[1]} {name}")
+        except Exception as e:
+            print(f"  couldn't grade {name}: {e}")
+    day = local_today().isoformat()
+    games = [g for g in day_games_safe(day) if not _started(g.get("startTimeUTC", ""))]
+    if not games:
+        print(f"  no games left to predict on {day}")
+        return
+    try:
+        saved, saved_p = simulate_slate(day, games, int(os.environ.get("NHL_AUTOSAVE_SIMS", "3000")), True)
+        print(f"  {day}: saved {saved} game and {saved_p} player prediction set(s) for {len(games)} upcoming game(s)")
+        for gid, r in ss.get("slate", {}).get(day, {}).items():
+            if "error" in r:
+                print(f"    {r['away']} @ {r['home']}: {r['error']}")
+            else:
+                print(f"    {r['away']} @ {r['home']}: {r['home']} {100 * r['p_home']:.0f}% · {r['ag']} vs {r['hg']}")
+    except Exception as e:
+        print(f"  auto-save failed: {e}")
+        raise
+
+
+if os.environ.get("NHL_AUTOSAVE"):
+    autosave()
+    raise SystemExit(0)
 
 
 # ==========================================================================
